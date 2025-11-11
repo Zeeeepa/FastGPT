@@ -40,12 +40,11 @@ const AppTypeTag = ({ type }: { type: AppTypeEnum }) => {
     },
     [AppTypeEnum.tool]: undefined,
     [AppTypeEnum.folder]: undefined,
-    [AppTypeEnum.hidden]: undefined,
-    [AppTypeEnum.agent]: undefined
+    [AppTypeEnum.hidden]: undefined
   });
 
   const data = map.current[type as keyof typeof map.current];
-
+  console.log(type, data);
   return data ? (
     <Flex
       bg={'myGray.100'}
