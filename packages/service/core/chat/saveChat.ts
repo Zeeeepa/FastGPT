@@ -1,7 +1,11 @@
-import type { AIChatItemType, UserChatItemType } from '@fastgpt/global/core/chat/type.d';
+import type {
+  AIChatItemType,
+  ChatHistoryItemResType,
+  UserChatItemType
+} from '@fastgpt/global/core/chat/type.d';
 import { MongoApp } from '../app/schema';
 import type { ChatSourceEnum } from '@fastgpt/global/core/chat/constants';
-import { ChatItemValueTypeEnum, ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
+import { ChatRoleEnum } from '@fastgpt/global/core/chat/constants';
 import { MongoChatItem } from './chatItemSchema';
 import { MongoChat } from './chatSchema';
 import { addLog } from '../../common/system/log';
@@ -19,6 +23,7 @@ import { MongoChatItemResponse } from './chatItemResponseSchema';
 import { chatValue2RuntimePrompt } from '@fastgpt/global/core/chat/adapt';
 import { MongoS3TTL } from '../../common/s3/schema';
 import type { ClientSession } from '../../common/mongo';
+import { ConfirmPlanAgentText } from '@fastgpt/global/core/workflow/runtime/constants';
 
 type Props = {
   chatId: string;
@@ -44,7 +49,7 @@ type Props = {
 const beforProcess = (props: Props) => {
   // Remove url
   props.userContent.value.forEach((item) => {
-    if (item.type === ChatItemValueTypeEnum.file && item.file?.key) {
+    if (item.file?.key) {
       item.file.url = '';
     }
   });
@@ -61,7 +66,7 @@ const afterProcess = async ({
     .map((item) => {
       if (item.value && Array.isArray(item.value)) {
         return item.value.map((valueItem) => {
-          if (valueItem.type === ChatItemValueTypeEnum.file && valueItem.file?.key) {
+          if ('file' in valueItem && valueItem.file?.key) {
             return valueItem.file.key;
           }
         });
@@ -107,7 +112,7 @@ const formatAiContent = ({
       };
     }
     return responseItem;
-  });
+  }) as ChatHistoryItemResType[] | undefined;
 
   return {
     aiResponse: {
@@ -141,7 +146,7 @@ const getChatDataLog = async ({
   };
 };
 
-export async function saveChat(props: Props) {
+export const pushChatRecords = async (props: Props) => {
   beforProcess(props);
 
   const {
@@ -329,10 +334,15 @@ export async function saveChat(props: Props) {
       ).catch();
     }
   } catch (error) {
-    addLog.error(`update chat history error`, error);
+    addLog.error(`Save chat history error`, error);
   }
-}
+};
 
+/* 
+  更新交互节点，包含两种情况：
+  1. 更新当前的 items，并把 value 追加到当前 items
+  2. 新增 items, 次数只需要改当前的 items 里的交互节点值即可，其他属性追加在新增的 items 里
+*/
 export const updateInteractiveChat = async (props: Props) => {
   beforProcess(props);
 
@@ -346,19 +356,32 @@ export const updateInteractiveChat = async (props: Props) => {
 
   if (!chatItem || chatItem.obj !== ChatRoleEnum.AI) return;
 
-  // Update interactive value
+  // Get interactive value
   const interactiveValue = chatItem.value[chatItem.value.length - 1];
-
-  if (
-    !interactiveValue ||
-    interactiveValue.type !== ChatItemValueTypeEnum.interactive ||
-    !interactiveValue.interactive?.params
-  ) {
+  if (!interactiveValue || !interactiveValue.interactive) {
     return;
+  }
+  interactiveValue.interactive.params = interactiveValue.interactive.params || {};
+
+  // Get interactive response
+  const { text: userInteractiveVal } = chatValue2RuntimePrompt(userContent.value);
+
+  // 拿到的是实参
+  const finalInteractive = extractDeepestInteractive(interactiveValue.interactive);
+  /* 
+    需要追加一条 chat_items 记录，而不是修改原来的。
+    1. Ask query: 用户肯定会输入一条新消息
+    2. Plan check 非确认模式，用户也是输入一条消息。
+  */
+  const pushNewItems =
+    finalInteractive.type === 'agentPlanAskQuery' ||
+    (finalInteractive.type === 'agentPlanCheck' && userInteractiveVal !== ConfirmPlanAgentText);
+
+  if (pushNewItems) {
+    return await pushChatRecords(props);
   }
 
   const parsedUserInteractiveVal = (() => {
-    const { text: userInteractiveVal } = chatValue2RuntimePrompt(userContent.value);
     try {
       return JSON.parse(userInteractiveVal);
     } catch (err) {
@@ -371,47 +394,99 @@ export const updateInteractiveChat = async (props: Props) => {
     errorMsg
   });
 
-  let finalInteractive = extractDeepestInteractive(interactiveValue.interactive);
-
-  if (finalInteractive.type === 'userSelect') {
-    finalInteractive.params.userSelectedVal = parsedUserInteractiveVal;
-  } else if (
-    finalInteractive.type === 'userInput' &&
-    typeof parsedUserInteractiveVal === 'object'
-  ) {
-    finalInteractive.params.inputForm = finalInteractive.params.inputForm.map((item) => {
-      const itemValue = parsedUserInteractiveVal[item.label];
-      return itemValue !== undefined
-        ? {
-            ...item,
-            value: itemValue
-          }
-        : item;
-    });
-    finalInteractive.params.submitted = true;
-  } else if (finalInteractive.type === 'paymentPause') {
-    chatItem.value.pop();
+  /* 
+    在原来 chat_items 上更新。
+    1. 更新交互响应结果
+    2. 合并 chat_item 数据
+    3. 合并 chat_item_response 数据
+  */
+  // Update interactive value
+  {
+    if (
+      finalInteractive.type === 'userSelect' ||
+      finalInteractive.type === 'agentPlanAskUserSelect'
+    ) {
+      finalInteractive.params.userSelectedVal = userInteractiveVal;
+    } else if (
+      (finalInteractive.type === 'userInput' || finalInteractive.type === 'agentPlanAskUserForm') &&
+      typeof parsedUserInteractiveVal === 'object'
+    ) {
+      finalInteractive.params.inputForm = finalInteractive.params.inputForm.map((item) => {
+        const itemValue = parsedUserInteractiveVal[item.label];
+        return itemValue !== undefined
+          ? {
+              ...item,
+              value: itemValue
+            }
+          : item;
+      });
+      finalInteractive.params.submitted = true;
+    } else if (finalInteractive.type === 'paymentPause') {
+      chatItem.value.pop();
+    } else if (finalInteractive.type === 'agentPlanCheck') {
+      finalInteractive.params.confirmed = true;
+    }
   }
 
-  if (aiResponse.customFeedbacks) {
-    chatItem.customFeedbacks = chatItem.customFeedbacks
-      ? [...chatItem.customFeedbacks, ...aiResponse.customFeedbacks]
-      : aiResponse.customFeedbacks;
-  }
-  if (aiResponse.value) {
-    chatItem.value = chatItem.value ? [...chatItem.value, ...aiResponse.value] : aiResponse.value;
-  }
-  if (aiResponse.citeCollectionIds) {
-    chatItem.citeCollectionIds = chatItem.citeCollectionIds
-      ? [...chatItem.citeCollectionIds, ...aiResponse.citeCollectionIds]
-      : aiResponse.citeCollectionIds;
+  // Update current items
+  {
+    if (aiContent.customFeedbacks) {
+      chatItem.customFeedbacks = chatItem.customFeedbacks
+        ? [...chatItem.customFeedbacks, ...aiContent.customFeedbacks]
+        : aiContent.customFeedbacks;
+    }
+    if (aiContent.value) {
+      chatItem.value = chatItem.value ? [...chatItem.value, ...aiContent.value] : aiContent.value;
+    }
+    if (aiResponse.citeCollectionIds) {
+      chatItem.citeCollectionIds = chatItem.citeCollectionIds
+        ? [...chatItem.citeCollectionIds, ...aiResponse.citeCollectionIds]
+        : aiResponse.citeCollectionIds;
+    }
+
+    if (aiContent.memories) {
+      chatItem.memories = {
+        ...chatItem.memories,
+        ...aiContent.memories
+      };
+    }
+
+    chatItem.durationSeconds = chatItem.durationSeconds
+      ? +(chatItem.durationSeconds + durationSeconds).toFixed(2)
+      : durationSeconds;
   }
 
-  chatItem.durationSeconds = chatItem.durationSeconds
-    ? +(chatItem.durationSeconds + durationSeconds).toFixed(2)
-    : durationSeconds;
-
+  chatItem.markModified('value');
   await mongoSessionRun(async (session) => {
+    // Merge chat item respones
+    if (nodeResponses) {
+      const lastResponse = await MongoChatItemResponse.findOne({
+        appId,
+        chatId,
+        chatItemDataId: chatItem.dataId
+      })
+        .sort({
+          _id: -1
+        })
+        .lean()
+        .session(session);
+
+      const newResponses = lastResponse?.data
+        ? mergeChatResponseData([lastResponse?.data, ...nodeResponses])
+        : nodeResponses;
+
+      await MongoChatItemResponse.create(
+        newResponses.map((item) => ({
+          teamId,
+          appId,
+          chatId,
+          chatItemDataId: chatItem.dataId,
+          data: item
+        })),
+        { session, ordered: true, ...writePrimary }
+      );
+    }
+
     await chatItem.save({ session });
     await MongoChat.updateOne(
       {
